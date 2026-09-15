@@ -1,0 +1,20 @@
+# Build artifacts
+inference/gpt2
+inference/*.o
+*.out
+
+# Python
+modelLoader/.venv/
+__pycache__/
+*.pyc
+.Python
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
