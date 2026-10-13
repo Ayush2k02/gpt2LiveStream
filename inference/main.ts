@@ -637,17 +637,17 @@ function transformer(layer: TransformerInput, numTokens: number, embeddings: Ten
 // Embedding step: turns token ids into input vectors (token embedding + position embedding).
 // In: weights and an array of token ids (length <= 1024). Out: (numTokens x 768).
 // e.g. [15496, 995] -> Float32Array(2 * 768) = [wte[15496] + wpe[0], wte[995] + wpe[1]]
-function getTokenEmbedding(weights: GptWeights, tokenIds: number[]): Tensor {
+function getTokenEmbedding(weights: GptWeights, tokenIds: number[], startPos = 0): Tensor {
   const n = tokenIds.length, d = EMBEDDING_DIMENSION;
-  if (n > CONTEXT_LENGTH) fail(`too many tokens: ${n} > ${CONTEXT_LENGTH}`);
+  if (startPos + n > CONTEXT_LENGTH) fail(`too many tokens: ${startPos + n} > ${CONTEXT_LENGTH}`);
   const out = new Float32Array(n * d);
 
-  // token t: wte[id] + wpe[t]
+  // token t: wte[id] + wpe[startPos + t]
   for (let t = 0; t < n; t++) {
-    const id = tokenIds[t];
+    const id = tokenIds[t], pos = startPos + t;
     if (id < 0 || id >= VOCAB_SIZE) fail(`bad token id ${id}`);
     const tokenVec = weights.embeddingWeights.subarray(id * d, (id + 1) * d);
-    const posVec = weights.positionalEmbeddingWeights.subarray(t * d, (t + 1) * d);
+    const posVec = weights.positionalEmbeddingWeights.subarray(pos * d, (pos + 1) * d);
     out.set(addVectors(tokenVec, posVec), t * d);
   }
   return out;
@@ -725,6 +725,144 @@ function gpt(weights: GptWeights, tokenIds: number[], topK: number, temperature:
 }
 
 
+// KV cache: every layer's keys and values for the tokens already processed, so each new token
+// only runs itself through the model instead of re-running the whole sequence.
+// k[layer] / v[layer] are flat (CONTEXT_LENGTH x 768); rows 0 .. length-1 are filled.
+interface KvCache {
+  k: Tensor[];
+  v: Tensor[];
+  length: number;
+}
+
+
+// KV cache: makes an empty cache for one generation (about 75MB: 12 layers x K,V x 1024 x 768 floats).
+// In: nothing. Out: a KvCache with length 0.
+// e.g. newKvCache() -> { k: [12 x Float32Array(1024*768)], v: [...], length: 0 }
+function newKvCache(): KvCache {
+  const k: Tensor[] = [], v: Tensor[] = [];
+  for (let i = 0; i < NUM_LAYERS; i++) {
+    k.push(new Float32Array(CONTEXT_LENGTH * EMBEDDING_DIMENSION));
+    v.push(new Float32Array(CONTEXT_LENGTH * EMBEDDING_DIMENSION));
+  }
+  return { k, v, length: 0 };
+}
+
+
+// KV cache, attention step: multi-head attention for only the new tokens, appending their K and V to the cache.
+// In: normed embeddings of the new tokens (numNew x 768) at positions startPos.., one layer's cache rows and weights.
+// Out: (numNew x 768), the same rows multiHeadAttention would give for these tokens over the full sequence.
+// e.g. startPos 5, numNew 1 -> the 6th token attends over cached rows 0..4 plus itself
+function multiHeadAttentionCached(numNew: number, startPos: number, embeddings: Tensor, cacheK: Tensor, cacheV: Tensor,
+                                  qWeights: Tensor, kWeights: Tensor, vWeights: Tensor,
+                                  qBiases: Tensor, kBiases: Tensor, vBiases: Tensor,
+                                  oWeights: Tensor, oBiases: Tensor): Tensor {
+  const m = numNew, d = EMBEDDING_DIMENSION, hd = HEAD_DIM;
+  const scale = 1 / Math.sqrt(hd);
+
+  // full-width q for the new tokens; their k and v go straight into the cache
+  const q = new Float32Array(m * d);
+  for (let t = 0; t < m; t++) {
+    const x = embeddings.subarray(t * d, (t + 1) * d);
+    q.set(forwardPass(qWeights, qBiases, x), t * d);
+    cacheK.set(forwardPass(kWeights, kBiases, x), (startPos + t) * d);
+    cacheV.set(forwardPass(vWeights, vBiases, x), (startPos + t) * d);
+  }
+
+  const concat = new Float32Array(m * d);
+  const scores = new Float32Array(startPos + m);
+  for (let h = 0; h < NUM_HEADS; h++) {
+    const colStart = h * hd;
+    for (let t = 0; t < m; t++) {
+      const pos = startPos + t;
+      const qBase = t * d + colStart;
+
+      // scores against every cached key up to and including this token (causal by construction)
+      for (let j = 0; j <= pos; j++) {
+        const kBase = j * d + colStart;
+        let sum = 0;
+        for (let e = 0; e < hd; e++) sum += q[qBase + e] * cacheK[kBase + e];
+        scores[j] = sum * scale;
+      }
+      const probs = softmax(scores.subarray(0, pos + 1));
+
+      // weighted sum of cached values into this head's slice
+      const outBase = t * d + colStart;
+      for (let j = 0; j <= pos; j++) {
+        const p = probs[j], vBase = j * d + colStart;
+        for (let e = 0; e < hd; e++) concat[outBase + e] += p * cacheV[vBase + e];
+      }
+    }
+  }
+
+  // output projection, one row per new token
+  const out = new Float32Array(m * d);
+  for (let t = 0; t < m; t++) out.set(forwardPass(oWeights, oBiases, concat.subarray(t * d, (t + 1) * d)), t * d);
+  return out;
+}
+
+
+// KV cache, transformer block step: same as transformer, but only for the new tokens, using this layer's cache.
+// In: one layer's weights, its cache rows, startPos, numNew, hidden state of the new tokens (numNew x 768).
+// Out: new hidden state for those tokens (numNew x 768).
+// e.g. (layer 0, k[0], v[0], 5, 1, hidden (1 x 768)) -> Float32Array(768)
+function transformerCached(layer: TransformerInput, cacheK: Tensor, cacheV: Tensor,
+                           startPos: number, numNew: number, embeddings: Tensor): Tensor {
+  const m = numNew, d = EMBEDDING_DIMENSION;
+
+  // layerNorm every token's row on its own
+  function normRows(x: Tensor, weights: Tensor, biases: Tensor): Tensor {
+    const out = new Float32Array(m * d);
+    for (let t = 0; t < m; t++) out.set(layerNorm(x.subarray(t * d, (t + 1) * d), weights, biases), t * d);
+    return out;
+  }
+
+  // attention sub-block with residual, reading and extending the cache
+  const normed1 = normRows(embeddings, layer.lnAttnWeights, layer.lnAttnBiases);
+  const attnOut = multiHeadAttentionCached(m, startPos, normed1, cacheK, cacheV,
+                                           layer.qWeights, layer.kWeights, layer.vWeights,
+                                           layer.qBiases, layer.kBiases, layer.vBiases,
+                                           layer.oWeights, layer.oBiases);
+  const x = addVectors(embeddings, attnOut);
+
+  // mlp sub-block with residual (no cache needed, tokens don't mix here)
+  const normed2 = normRows(x, layer.lnMlpWeights, layer.lnMlpBiases);
+  const mlpOut = mlp(m, d, normed2, layer.l1Weights, layer.l1Biases, layer.l2Weights, layer.l2Biases);
+  return addVectors(x, mlpOut);
+}
+
+
+// KV cache, full forward pass: runs only the new tokens through all 12 layers, then advances the cache.
+// In: weights, the new token ids (the whole prompt first, then one id per step), the cache. Out: normed hidden (numNew x 768).
+// e.g. prompt [15496, 995] -> (2 x 768) and cache.length 2; then [11] -> (1 x 768) and cache.length 3
+function forwardModelCached(weights: GptWeights, newTokenIds: number[], cache: KvCache): Tensor {
+  const m = newTokenIds.length, d = EMBEDDING_DIMENSION, startPos = cache.length;
+
+  let hidden = getTokenEmbedding(weights, newTokenIds, startPos);
+  for (let i = 0; i < NUM_LAYERS; i++) {
+    hidden = transformerCached(weights.transformerWeights[i], cache.k[i], cache.v[i], startPos, m, hidden);
+  }
+  cache.length += m;
+
+  // final ln_f on every token's row
+  const out = new Float32Array(m * d);
+  for (let t = 0; t < m; t++) {
+    out.set(layerNorm(hidden.subarray(t * d, (t + 1) * d), weights.finalWeights, weights.finalBiases), t * d);
+  }
+  return out;
+}
+
+
+// KV cache, one generation step: like gpt, but only feeds the tokens the cache hasn't seen yet.
+// In: weights, the new token ids, the cache, topK, temperature, rng. Out: the next token id.
+// e.g. ([15496, 995], empty cache) -> 11 (","); then ([11], same cache) -> the token after ","
+function gptCached(weights: GptWeights, newTokenIds: number[], cache: KvCache,
+                   topK: number, temperature: number, rng: Rng): number {
+  const hidden = forwardModelCached(weights, newTokenIds, cache);
+  const logits = logitsForLastToken(weights, hidden, newTokenIds.length);
+  return sampleTopK(logits, topK, temperature, rng);
+}
+
+
 // Entry point / generation loop: loads everything, then reads prompts and streams generated text.
 // In: prompt and token count from stdin. Out: generated text written to stdout.
 // e.g. prompt "Hello world", 3 tokens -> prints "Hello world, I'm"
@@ -758,12 +896,17 @@ async function main(): Promise<void> {
 
     const tokenIds = tokenize(prompt);
     process.stdout.write(detokenize(tokenIds));
+
+    // first step feeds the whole prompt, every later step feeds just the token it sampled
+    const cache = newKvCache();
+    let pending = tokenIds.slice();
     for (let i = 0; i < maxNewTokens; i++) {
       if (tokenIds.length >= CONTEXT_LENGTH) break;
-      const nextId = gpt(weights, tokenIds, topK, temperature, rng);
+      const nextId = gptCached(weights, pending, cache, topK, temperature, rng);
       tokenIds.push(nextId);
       process.stdout.write(detokenize([nextId]));
       if (nextId === 50256) break; // <|endoftext|>
+      pending = [nextId];
     }
     process.stdout.write("\n\n");
   }
