@@ -1,0 +1,13 @@
+{
+  "name": "gpt2-inference",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
+  }
+}
